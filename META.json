@@ -1,0 +1,44 @@
+{
+   "abstract" : "a perl content_filter for postfix",
+   "author" : [
+      "David Zurborg <zurborg@cpan.org>"
+   ],
+   "dynamic_config" : 1,
+   "generated_by" : "ExtUtils::MakeMaker version 6.6302, CPAN::Meta::Converter version 2.120921",
+   "license" : [
+      "unknown"
+   ],
+   "meta-spec" : {
+      "url" : "http://search.cpan.org/perldoc?CPAN::Meta::Spec",
+      "version" : "2"
+   },
+   "name" : "Postfix-ContentFilter",
+   "no_index" : {
+      "directory" : [
+         "t",
+         "inc"
+      ]
+   },
+   "prereqs" : {
+      "build" : {
+         "requires" : {
+            "ExtUtils::MakeMaker" : "0"
+         }
+      },
+      "configure" : {
+         "requires" : {
+            "ExtUtils::MakeMaker" : "0"
+         }
+      },
+      "runtime" : {
+         "requires" : {
+            "IPC::Open2" : "1.03",
+            "MIME::Parser" : "5.503",
+            "Test::More" : "0",
+            "Try::Tiny" : "0.11"
+         }
+      }
+   },
+   "release_status" : "stable",
+   "version" : "1.01"
+}
