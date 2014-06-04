@@ -18,8 +18,7 @@ no_index:
     - t
     - inc
 requires:
-  IPC::Open2: 1.03
-  MIME::Parser: 5.503
+  IPC::Open3: 1.12
   Test::More: 0
   Try::Tiny: 0.11
-version: 1.02
+version: 1.10
