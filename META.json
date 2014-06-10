@@ -33,11 +33,12 @@
       "runtime" : {
          "requires" : {
             "IPC::Open3" : "1.12",
-            "Test::More" : "0",
+            "Modern::Perl" : "0",
+            "Test::Most" : "0",
             "Try::Tiny" : "0.11"
          }
       }
    },
    "release_status" : "stable",
-   "version" : "1.10"
+   "version" : "1.11"
 }
