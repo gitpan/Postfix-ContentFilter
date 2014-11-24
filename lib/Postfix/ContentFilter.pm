@@ -1,10 +1,149 @@
+use strict;
+use warnings;
 package Postfix::ContentFilter;
+# ABSTRACT: a perl content_filter for postfix
 
-use Modern::Perl;
 use Carp;
 use Try::Tiny 0.11;
-use IPC::Open3 1.03;
+use IPC::Run 0.92 qw(start pump finish timeout);
 use Scalar::Util qw(blessed);
+use Class::Load qw(load_first_existing_class);
+
+our $VERSION = '1.12'; # VERSION
+
+
+our $parser;
+our $sendmail = [qw[ /usr/sbin/sendmail -G -i ]];
+our $output;
+our $error;
+
+
+sub new($%) {
+	my ($class, $options) = @_;
+    my $self = bless {}, $class;
+    if ($options && $options->{parser}) {
+        parser($self, $options->{parser});
+    }
+    return $self;
+}
+
+
+sub parser {
+    my ($self, $ptype) = @_;
+	my $parsers = {
+		# Key is parser, value is returned entity
+		'MIME::Parser'  => 'MIME::Entity',
+		'Mail::Message' => 'Mail::Message',
+	};
+	
+	return $self->{parser} if defined $self->{parser} and not defined $ptype;
+
+	$ptype = load_first_existing_class(map { $_ => {} } ($ptype || qw(MIME::Parser Mail::Message)));
+	
+	if (my $ent = $parsers->{$ptype}) {
+        $self->{parser} = $ptype;
+        $self->{entity} = $ent;
+    } else {
+        croak "Unknown parser $ptype";
+    }
+	
+    return $self->{parser};
+}
+
+sub _parse {
+	my ($self, $handle) = @_;
+}
+
+
+sub process($&;*) {
+    my ($class, $coderef, $handle) = @_;
+    
+    my $self = blessed $class
+	         ? $class
+			 : bless {}, $class
+			 ; # For backwards compatibility, to enable calling directly
+
+    confess "please call as ".__PACKAGE__."->process(sub{ ... })" unless ref $coderef eq 'CODE';
+    
+    $handle = \*STDIN unless ref $handle eq 'GLOB';
+
+    my $entity;
+    my $parser = $self->parser;
+    my $module = ref $parser || $parser;
+	
+    if ($module eq 'Mail::Message') {
+        $entity = $parser->read($handle) or confess "failed to parse with Mail::Message";
+    } elsif ($module eq 'MIME::Parser') {
+        $parser = $parser->new;
+        $entity = $parser->parse($handle) or confess "failed to parse wth MIME::Parser";
+    } else {
+        confess "Unkown parser $parser";
+    }
+	
+    try {
+		$entity = $coderef->($entity);
+    } catch {
+        $module = ref $parser || $parser;
+        if ($module eq 'Mail::Message') {
+            $entity->DESTROY;
+        } elsif ($module eq 'MIME::Parser') {
+            $parser->filer->purge;
+        }
+        confess $_;
+    };
+    
+    confess "subref should return instance of $self->{entity}"
+        unless blessed($entity) and $entity->isa($self->{entity});
+
+    my $ret;
+    
+    delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV', 'PATH'} if ${^TAINT};
+    
+    $output = undef;
+    $error = undef;
+
+	my $in;
+	
+	try {
+    
+		my $h = start [ @$sendmail, @ARGV ], \$in, \$output, \$error, timeout(60);
+		
+		my $module = ref $parser || $parser;
+		if ($module eq 'Mail::Message') {
+                        $in = $entity->string;
+                } elsif ($module eq 'MIME::Parser') {
+                        $in = $entity->as_string;
+		}
+		
+		pump $h;
+		
+		$ret = finish $h;
+		
+	} catch {
+
+		local $, = ' ';
+		confess "error: $_ with @$sendmail @ARGV";
+
+	} finally {
+
+	        my $module = ref $parser || $parser;
+		if ($module eq 'Mail::Message') {
+                        $entity->DESTROY;
+                } elsif ($module eq 'MIME::Parser') {
+                        $parser->filer->purge;
+		}
+
+	};
+	
+    return $ret;
+}
+
+
+1;
+
+__END__
+
+=pod
 
 =head1 NAME
 
@@ -12,11 +151,11 @@ Postfix::ContentFilter - a perl content_filter for postfix
 
 =head1 VERSION
 
-Version 1.11
+version 1.12
 
-=cut
+=head1 DESCRIPTION
 
-our $VERSION = '1.11';
+Postfix::ContentFilter can be used for C<content_filter> scripts, as described here: L<http://www.postfix.org/FILTER_README.html>.
 
 =head1 SYNOPSIS
 
@@ -43,165 +182,23 @@ our $VERSION = '1.11';
 
     exit $exitcode;
 
-=head1 DESCRIPTION
-
-Postfix::ContentFilter can be used for C<content_filter> scripts, as described here: L<http://www.postfix.org/FILTER_README.html>.
-
-=cut
-
-our $parser;
-our $sendmail = [qw[ /usr/sbin/sendmail -G -i ]];
-our $output;
-our $error;
-
-=head1 FUNCTIONS
+=head1 METHODS
 
 =head2 new($args)
+
 C<new> creates a new Postfix::Contentfilter. It takes an optional argument of a hash with the key 'parser', which specifies the parser to use as per C<footer>. This can be either C<MIME::Entity> or C<Mail::Message>.
 
 Alternatively C<process> can be called directly.
 
-=cut
-
-sub new($%)
-{   my ($class, $options) = @_;
-    my $self = bless {}, $class;
-    if ($options && $options->{parser})
-    {
-        parser($self, $options->{parser});
-    }
-
-    $self;
-}
-
 =head2 parser($string)
 
 C<parser()> specifies the parser to use, which can be either C<MIME::Parser> or C<Mail::Message>. It defaults to C<MIME::Parser>, if available, or C<Mail::Message> whichever could be found first. When called without any arguments, it returns the current parser.
-
-=cut
-
-sub _load_any {
-	foreach my $module (@_) {
-		my $path = $module;
-		$path =~ s/::/\//g;
-		$path .= '.pm';
-		return $module if exists $INC{$path};
-		eval "require $module; 1" and return $module;
-	}
-    croak("Couldn't find any of these implementations: @_");
-}
-
-sub parser {
-    my ($self, $ptype) = @_;
-	my $parsers = {
-		# Key is parser, value is returned entity
-		'MIME::Parser'  => 'MIME::Entity',
-		'Mail::Message' => 'Mail::Message',
-	};
-	
-	return $self->{parser} if defined $self->{parser} and not defined $ptype;
-
-	$ptype = _load_any($ptype || qw(MIME::Parser Mail::Message));
-	
-	if (my $ent = $parsers->{$ptype}) {
-        $self->{parser} = $ptype;
-        $self->{entity} = $ent;
-    } else {
-        croak "Unknown parser $ptype";
-    }
-	
-    return $self->{parser};
-}
-
-sub _parse {
-	my ($self, $handle) = @_;
-}
 
 =head2 process($coderef [, $inputhandle])
 
 C<process()> reads the mail from C<STDIN> (or C<$inputhandle>, if given), parses it, calls the coderef and finally runs C<sendmail> with our own command-line arguments (C<@ARGV>).
 
 This function returns the exitcode of C<sendmail>.
-
-=cut
-
-sub process($&;*) {
-    my ($class, $coderef, $handle) = @_;
-    
-    my $self = blessed $class
-	         ? $class
-			 : bless {}, $class
-			 ; # For backwards compatibility, to enable calling directly
-
-    confess "please call as ".__PACKAGE__."->process(sub{ ... })" unless ref $coderef eq 'CODE';
-    
-    $handle = \*STDIN unless ref $handle eq 'GLOB';
-
-    my $entity;
-    my $parser = $self->parser;
-	
-	given (ref $parser || $parser) {
-		when ('Mail::Message') {
-			$entity = $parser->read($handle) or confess "failed to parse with Mail::Message";
-		}
-		when ('MIME::Parser') {
-			$parser = $parser->new;
-			$entity = $parser->parse($handle) or confess "failed to parse wth MIME::Parser";
-		}
-		default {
-			confess "Unkown parser $parser";
-		}
-	}
-	
-    try {
-		$entity = $coderef->($entity);
-    } catch {
-		given (ref $parser || $parser) {
-			when ('Mail::Message') {
-	            $entity->DESTROY;
-			}
-			when ('MIME::Parser') {
-	            $parser->filer->purge;
-			}
-		}
-		confess $_;
-    };
-    
-    confess "subref should return instance of $self->{entity}"
-        unless blessed($entity) and $entity->isa($self->{entity});
-
-    my $ret = -1;
-    
-    $SIG{CHLD} = sub { wait; $ret = $? if $? >= 0 };
-    
-    delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV', 'PATH'} if ${^TAINT};
-    
-    my ($in, $out, $err);
-    my $pid = open3 ($in, $out, $err, @$sendmail, @ARGV) or confess "open3: $!";
-    
-    $entity->print($in) or confess "print: $!";
-
-    close $in;
-    
-    $output = join '' => <$out> if defined $out;
-    $error = join '' => <$err> if defined $err;
-    
-    close $out;
-    
-    waitpid($pid, 0);
-	$ret = $? if $? >= 0;
-    
-	given (ref $parser || $parser) {
-		when ('Mail::Message') {
-			$entity->DESTROY;
-		}
-		when ('MIME::Parser') {
-			$parser->filer->purge;
-		}
-	}
-	
-    return $ret == 0 ? 1 : 0;
-}
 
 =head1 VARIABLES
 
@@ -251,53 +248,25 @@ So set C<$Postfix::ContentFilter::sendmail> to an absolute path, if you are usin
 
 =back
 
-=head1 AUTHOR
-
-David Zurborg, C<< <zurborg at cpan.org> >>
-
 =head1 BUGS
 
-Please report any bugs or feature requests trough L<my project management tool|http://development.david-zurb.org/projects/libpostfix-contentfilter-perl/issues/new>. I will be notified, and then you'll
-automatically be notified of progress on your bug as I make changes.
+Please report any bugs or feature requests on the bugtracker website
+https://github.com/zurborg/libpostfix-contentfilter-perl/issues
 
-=head1 SUPPORT
+When submitting a bug or request, please include a test-file or a
+patch to an existing test-file that illustrates the bug or desired
+feature.
 
-You can find documentation for this module with the perldoc command.
+=head1 AUTHOR
 
-    perldoc Postfix::ContentFilter
+David Zurborg <zurborg@cpan.org>
 
-You can also look for information at:
+=head1 COPYRIGHT AND LICENSE
 
-=over 4
+This software is Copyright (c) 2014 by David Zurborg.
 
-=item * Redmine: Homepage of this module
+This is free software, licensed under:
 
-L<http://development.david-zurb.org/projects/libpostfix-contentfilter-perl>
-
-=item * RT: CPAN's request tracker
-
-L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=Postfix-ContentFilter>
-
-=item * AnnoCPAN: Annotated CPAN documentation
-
-L<http://annocpan.org/dist/Postfix-ContentFilter>
-
-=item * CPAN Ratings
-
-L<http://cpanratings.perl.org/d/Postfix-ContentFilter>
-
-=item * Search CPAN
-
-L<http://search.cpan.org/dist/Postfix-ContentFilter/>
-
-=back
-
-=head1 COPYRIGHT & LICENSE
-
-Copyright 2014 David Zurborg, all rights reserved.
-
-This program is free software; you can redistribute it and/or modify it under the terms of the ISC license.
+  The ISC License
 
 =cut
-
-1; # End of Postfix::ContentFilter
